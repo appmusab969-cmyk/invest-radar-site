@@ -1,0 +1,74 @@
+name: Gun Ici Fiyat
+
+# Bu dosya ozel depodaki backend/site/canli.yml'den kopyalanir - burada degistirmeyin.
+# Borsa saatlerinde ekranlari guncel Yahoo fiyatlariyla yeniden uretir,
+# anahtarla sifreler ve yayinlar. Tarama YAPMAZ; sistemlerin alim-satimi aksam taramasindadir.
+# Herkese acik depoda calistigi icin GitHub Actions dakikasi harcanmaz.
+on:
+  schedule:
+    # GitHub zamanlayicisi az kullanilan depolarda calistirmalari geciktirir/atlar.
+    # Bu yuzden tek calistirma seans sonuna kadar kendi icinde ~15 dk'da bir yeniler;
+    # birden fazla cron yalniz yedek tetikleyicidir (biri calisirken digerleri sirada bekler).
+    - cron: "5 7 * * 1-5"
+    - cron: "5 10 * * 1-5"
+    - cron: "5 13 * * 1-5"
+    - cron: "5 16 * * 1-5"
+    - cron: "5 19 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: canli
+  cancel-in-progress: false
+
+jobs:
+  fiyat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: site
+      - uses: actions/checkout@v4
+        with:
+          repository: appmusab969-cmyk/invest-radar
+          ssh-key: ${{ secrets.OZEL_DEPO_OKUMA }}
+          path: src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: src/backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/backend
+      - name: Seans sonuna kadar ~15 dk'da bir guncel fiyatla uret, sifrele, yayinla
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          W="$GITHUB_WORKSPACE"
+          # 21:00 UTC = 24:00 TSI; ayrica 5 saat 45 dk is suresi siniri
+          BITIS=$(( $(date +%s) + 345*60 ))
+          while [ "$(date -u +%H)" -lt 21 ] && [ "$(date +%s)" -lt "$BITIS" ]; do
+            BAS=$(date +%s)
+            rm -rf "$W/yeni"
+            # Ozel depodaki en son veriyi al: aksam taramasi ya da elle yapilan bir duzeltme
+            # bu calistirma basladiktan sonra yayinlanmis olabilir; eski kopya onu ezerdi.
+            git -C "$W/src" fetch -q --depth 1 origin master && git -C "$W/src" reset -q --hard FETCH_HEAD || echo "Ozel depo tazelenemedi; mevcut kopya kullaniliyor."
+            if (cd "$W/src/backend" && bash scripts/statik.sh "$W/yeni" && node scripts/sifrele.mjs "$W/yeni/data"); then
+              cd "$W/site"
+              # Aksam yayini depoyu bastan yazar (force push); en son hali uzerine calis
+              git fetch -q origin main && git reset -q --hard origin/main
+              rm -rf data && cp -r ../yeni/data data
+              git add -A data
+              if ! git diff --cached --quiet; then
+                git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" commit -qm "gun ici fiyat $(date -u +%H:%M)"
+                git push || echo "Push reddedildi (aksam yayini ile ayni anda); sonraki turda yenilenir."
+              fi
+            else
+              echo "Uretim basarisiz; sonraki turda tekrar denenecek."
+            fi
+            KALAN=$(( 900 - ($(date +%s) - BAS) ))
+            [ "$KALAN" -gt 0 ] && sleep "$KALAN"
+          done
