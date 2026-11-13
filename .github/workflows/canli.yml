@@ -1,0 +1,98 @@
+name: Gun Ici Fiyat
+
+# Bu dosya ozel depodaki backend/site/canli.yml'den kopyalanir - burada degistirmeyin.
+# Borsa saatlerinde ekranlari guncel Yahoo fiyatlariyla yeniden uretir,
+# anahtarla sifreler ve yayinlar. Tarama YAPMAZ; sistemlerin alim-satimi aksam taramasindadir.
+# Herkese acik depoda calistigi icin GitHub Actions dakikasi harcanmaz.
+on:
+  schedule:
+    # GitHub zamanlayicisi az kullanilan depolarda calistirmalari saatlerce geciktirir/atlar
+    # (2026-10-27: 07:05 ve 10:05 hic calismadi, ilk calistirma 13:08 UTC - ogle saatinde
+    # ekranda bir onceki gunun fiyati vardi). Bu yuzden:
+    #  - tek calistirma ~15 dk'da bir yeniler, seans disinda bekler;
+    #  - is suresi sinirina gelince bir sonrakini KENDISI baslatir (zincir, cron'a bagli degil);
+    #  - gece cron'lari seanstan saatler once tetiklenir, gecikseler de acilisi kacirmazlar.
+    # Diger cron'lar yalniz yedek (biri calisirken digerleri sirada bekler).
+    - cron: "0 1 * * 1-5"
+    - cron: "0 4 * * 1-5"
+    - cron: "5 7 * * 1-5"
+    - cron: "5 10 * * 1-5"
+    - cron: "5 13 * * 1-5"
+    - cron: "5 16 * * 1-5"
+    - cron: "5 19 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  actions: write # zincir: bir sonraki calistirmayi baslatmak icin
+
+concurrency:
+  group: canli
+  cancel-in-progress: false
+
+jobs:
+  fiyat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: site
+      - uses: actions/checkout@v4
+        with:
+          repository: appmusab969-cmyk/invest-radar
+          ssh-key: ${{ secrets.OZEL_DEPO_OKUMA }}
+          path: src
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: src/backend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: src/backend
+      - name: Seans sonuna kadar ~15 dk'da bir guncel fiyatla uret, sifrele, yayinla
+        env:
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          W="$GITHUB_WORKSPACE"
+          # Hafta ici 07:00-21:30 UTC (BIST 10:00 TSI acilis - ABD kis saatinde 21:00 UTC kapanis
+          # + 15 dk Yahoo gecikmesi). 5 saat 45 dk is suresi siniri.
+          seans() { [ "$(date -u +%u)" -le 5 ] && [ "$(date -u +%H%M)" -ge 0700 ] && [ "$(date -u +%H%M)" -lt 2130 ]; }
+          BITIS=$(( $(date +%s) + 345*60 ))
+          while [ "$(date +%s)" -lt "$BITIS" ]; do
+            BAS=$(date +%s)
+            if ! seans; then
+              # Hafta sonu ya da Cuma seans sonu: zinciri bitir (Pazartesi gece cron'u yeniden baslatir).
+              # Hafta ici gece ise bekle; ertesi sabahin acilisi bu zincirle yakalanir.
+              G=$(date -u +%u)
+              { [ "$G" -ge 6 ] || { [ "$G" = 5 ] && [ "$(date -u +%H)" -ge 21 ]; }; } && break
+              sleep 300; continue
+            fi
+            rm -rf "$W/yeni"
+            # Ozel depodaki en son veriyi al: aksam taramasi ya da elle yapilan bir duzeltme
+            # bu calistirma basladiktan sonra yayinlanmis olabilir; eski kopya onu ezerdi.
+            git -C "$W/src" fetch -q --depth 1 origin master && git -C "$W/src" reset -q --hard FETCH_HEAD || echo "Ozel depo tazelenemedi; mevcut kopya kullaniliyor."
+            if (cd "$W/src/backend" && bash scripts/statik.sh "$W/yeni" && node scripts/sifrele.mjs "$W/yeni/data"); then
+              cd "$W/site"
+              # Aksam yayini depoyu bastan yazar (force push); en son hali uzerine calis
+              git fetch -q origin main && git reset -q --hard origin/main
+              rm -rf data && cp -r ../yeni/data data
+              git add -A data
+              if ! git diff --cached --quiet; then
+                git -c user.name="github-actions[bot]" -c user.email="github-actions[bot]@users.noreply.github.com" commit -qm "gun ici fiyat $(date -u +%H:%M)"
+                git push || echo "Push reddedildi (aksam yayini ile ayni anda); sonraki turda yenilenir."
+              fi
+            else
+              echo "Uretim basarisiz; sonraki turda tekrar denenecek."
+            fi
+            KALAN=$(( 900 - ($(date +%s) - BAS) ))
+            [ "$KALAN" -gt 0 ] && sleep "$KALAN"
+          done
+          echo "ZINCIR=$([ "$(date +%s)" -ge "$BITIS" ] && echo 1 || echo 0)" >> "$GITHUB_ENV"
+      # Sure doldugu icin cikildiysa (seans/ertesi is gunu surerken) bir sonraki calistirmayi baslat.
+      # GITHUB_TOKEN ile workflow_dispatch tetiklemesine GitHub izin verir.
+      - name: Zinciri surdur
+        if: always() && env.ZINCIR == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run canli.yml -R "$GITHUB_REPOSITORY" --ref main
